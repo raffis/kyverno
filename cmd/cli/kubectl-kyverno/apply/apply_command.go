@@ -6,7 +6,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-billy/v5/memfs"
@@ -62,6 +64,7 @@ type ApplyCommandConfig struct {
 	GitBranch      string
 	warnExitCode   int
 	warnNoPassed   bool
+	worker         int
 }
 
 var (
@@ -203,6 +206,7 @@ func Command() *cobra.Command {
 	cmd.Flags().BoolVar(&removeColor, "remove-color", false, "Remove any color from output")
 	cmd.Flags().BoolVar(&detailedResults, "detailed-results", false, "If set to true, display detailed results")
 	cmd.Flags().BoolVarP(&table, "table", "t", false, "Show results in table format")
+	cmd.Flags().IntVarP(&applyCommandConfig.worker, "worker", "w", runtime.NumCPU(), "Number of workers to process the policies")
 	return cmd
 }
 
@@ -308,59 +312,128 @@ func (c *ApplyCommandConfig) applyPolicytoResource(variables map[string]string, 
 
 	var rc common.ResultCounts
 	var responses []engineapi.EngineResponse
-	for _, resource := range resources {
-		for _, policy := range policies {
-			_, err := policyvalidation.Validate(policy, nil, nil, true, openApiManager, config.KyvernoUserName(config.KyvernoServiceAccountName()))
-			if err != nil {
-				log.Log.Error(err, "policy validation error")
-				if strings.HasPrefix(err.Error(), "variable 'element.name'") {
-					skipInvalidPolicies.invalid = append(skipInvalidPolicies.invalid, policy.GetName())
-				} else {
-					skipInvalidPolicies.skipped = append(skipInvalidPolicies.skipped, policy.GetName())
-				}
+	resourceResults := make(chan resourceResult)
+	workers := make(chan struct{}, c.worker)
+	applyQueue := make(chan func() error)
+	var wg sync.WaitGroup
+	wg.Add(1)
 
-				continue
-			}
-			matches := common.HasVariables(policy)
-			variable := common.RemoveDuplicateAndObjectVariables(matches)
-			if len(variable) > 0 {
-				if len(variables) == 0 {
-					// check policy in variable file
-					if c.ValuesFile == "" || valuesMap[policy.GetName()] == nil {
-						skipInvalidPolicies.skipped = append(skipInvalidPolicies.skipped, policy.GetName())
-						continue
-					}
+	go func() {
+		defer wg.Done()
+		for _, resource := range resources {
+			for _, policy := range policies {
+				wg.Add(1)
+				applyQueue <- func() error {
+					return c.applyResourcePolicy(resourceResults, resource, policy, variables, openApiManager, valuesMap, dClient, subresources, globalValMap, userInfo, mutateLogPathIsDir, namespaceSelectorMap)
 				}
 			}
-			kindOnwhichPolicyIsApplied := common.GetKindsFromPolicy(policy, subresources, dClient)
-			thisPolicyResourceValues, err := common.CheckVariableForPolicy(valuesMap, globalValMap, policy.GetName(), resource.GetName(), resource.GetKind(), variables, kindOnwhichPolicyIsApplied, variable)
-			if err != nil {
-				return &rc, resources, skipInvalidPolicies, responses, sanitizederror.NewWithError(fmt.Sprintf("policy `%s` have variables. pass the values for the variables for resource `%s` using set/values_file flag", policy.GetName(), resource.GetName()), err)
+		}
+	}()
+
+	go func() {
+		for {
+			task := <-applyQueue
+			workers <- struct{}{}
+			go func() {
+				task()
+				<-workers
+			}()
+		}
+	}()
+
+	go func() {
+		for {
+			result := <-resourceResults
+			switch {
+			case result.err != nil:
+				log.Log.Error(result.err, "policy validation error")
+				if strings.HasPrefix(result.err.Error(), "variable 'element.name'") {
+					skipInvalidPolicies.invalid = append(skipInvalidPolicies.invalid, result.policy.GetName())
+				} else {
+					skipInvalidPolicies.skipped = append(skipInvalidPolicies.skipped, result.policy.GetName())
+				}
+			case result.skipped:
+				skipInvalidPolicies.skipped = append(skipInvalidPolicies.skipped, result.policy.GetName())
+			default:
+				responses = append(responses, result.ers...)
+				rc.Add(result.rc)
 			}
-			applyPolicyConfig := common.ApplyPolicyConfig{
-				Policy:               policy,
-				Resource:             resource,
-				MutateLogPath:        c.MutateLogPath,
-				MutateLogPathIsDir:   mutateLogPathIsDir,
-				Variables:            thisPolicyResourceValues,
-				UserInfo:             userInfo,
-				PolicyReport:         c.PolicyReport,
-				NamespaceSelectorMap: namespaceSelectorMap,
-				Stdin:                c.Stdin,
-				Rc:                   &rc,
-				PrintPatchResource:   true,
-				Client:               dClient,
-				AuditWarn:            c.AuditWarn,
-				Subresources:         subresources,
-			}
-			ers, err := common.ApplyPolicyOnResource(applyPolicyConfig)
-			if err != nil {
-				return &rc, resources, skipInvalidPolicies, responses, sanitizederror.NewWithError(fmt.Errorf("failed to apply policy %v on resource %v", policy.GetName(), resource.GetName()).Error(), err)
-			}
-			responses = append(responses, processSkipEngineResponses(ers, applyPolicyConfig)...)
+
+			wg.Done()
+		}
+	}()
+
+	wg.Wait()
+	return &rc, resources, skipInvalidPolicies, responses, nil
+}
+
+type resourceResult struct {
+	err     error
+	skipped bool
+	policy  kyvernov1.PolicyInterface
+	ers     []engineapi.EngineResponse
+	rc      common.ResultCounts
+}
+
+func (c *ApplyCommandConfig) applyResourcePolicy(resourceResults chan resourceResult, resource *unstructured.Unstructured, policy kyvernov1.PolicyInterface, variables map[string]string, openApiManager openapi.Manager, valuesMap map[string]map[string]values.Resource, dClient dclient.Interface, subresources []values.Subresource, globalValMap map[string]string, userInfo v1beta1.RequestInfo, mutateLogPathIsDir bool, namespaceSelectorMap map[string]map[string]string) error {
+	_, err := policyvalidation.Validate(policy, nil, nil, true, openApiManager, config.KyvernoUserName(config.KyvernoServiceAccountName()))
+	if err != nil {
+		resourceResults <- resourceResult{
+			policy: policy,
+			err:    err,
 		}
 	}
-	return &rc, resources, skipInvalidPolicies, responses, nil
+
+	matches := common.HasVariables(policy)
+	variable := common.RemoveDuplicateAndObjectVariables(matches)
+	if len(variable) > 0 {
+		if len(variables) == 0 {
+			// check policy in variable file
+			if c.ValuesFile == "" || valuesMap[policy.GetName()] == nil {
+				resourceResults <- resourceResult{
+					policy:  policy,
+					skipped: true,
+				}
+
+				return nil
+			}
+		}
+	}
+	kindOnwhichPolicyIsApplied := common.GetKindsFromPolicy(policy, subresources, dClient)
+	thisPolicyResourceValues, err := common.CheckVariableForPolicy(valuesMap, globalValMap, policy.GetName(), resource.GetName(), resource.GetKind(), variables, kindOnwhichPolicyIsApplied, variable)
+	if err != nil {
+		return sanitizederror.NewWithError(fmt.Sprintf("policy `%s` have variables. pass the values for the variables for resource `%s` using set/values_file flag", policy.GetName(), resource.GetName()), err)
+	}
+
+	rc := common.ResultCounts{}
+	applyPolicyConfig := common.ApplyPolicyConfig{
+		Policy:               policy,
+		Resource:             resource,
+		MutateLogPath:        c.MutateLogPath,
+		MutateLogPathIsDir:   mutateLogPathIsDir,
+		Variables:            thisPolicyResourceValues,
+		UserInfo:             userInfo,
+		PolicyReport:         c.PolicyReport,
+		NamespaceSelectorMap: namespaceSelectorMap,
+		Stdin:                c.Stdin,
+		Rc:                   &rc,
+		PrintPatchResource:   true,
+		Client:               dClient,
+		AuditWarn:            c.AuditWarn,
+		Subresources:         subresources,
+	}
+	ers, err := common.ApplyPolicyOnResource(applyPolicyConfig)
+	if err != nil {
+		return sanitizederror.NewWithError(fmt.Errorf("failed to apply policy %v on resource %v", policy.GetName(), resource.GetName()).Error(), err)
+	}
+
+	resourceResults <- resourceResult{
+		policy: policy,
+		ers:    ers,
+		rc:     rc,
+	}
+
+	return nil
 }
 
 func (c *ApplyCommandConfig) loadResources(policies []kyvernov1.PolicyInterface, validatingAdmissionPolicies []v1alpha1.ValidatingAdmissionPolicy, dClient dclient.Interface) []*unstructured.Unstructured {
